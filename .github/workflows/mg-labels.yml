@@ -1,0 +1,69 @@
+# mobius-gate — gate labels guard.
+# GitHub does not restrict who may set a label, so:
+#   - a gate label (mg:*-approved) set by a non-approver is removed;
+#   - label gates mode (vars.MG_GATES_MODE == 'label', when the GitHub plan
+#     offers no environment reviewers): an approver's mg:e2e-approved becomes
+#     the commit status mg/e2e-approved on the PR head;
+#   - any new commit removes mg:e2e-approved (the approval no longer applies).
+name: mg-labels
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions: {}
+
+jobs:
+  guard:
+    if: github.event.action == 'labeled'
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read, issues: write, pull-requests: write, statuses: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1, sparse-checkout: .github }
+      - id: cfg
+        uses: Revo2z/mobius-gate/actions/config@v0.1.0
+        with: { default-branch: "${{ github.event.repository.default_branch }}" }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.event.issue.number || github.event.pull_request.number }}
+          LABEL: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+          CFG: ${{ steps.cfg.outputs.json }}
+          APPROVER: ${{ contains(fromJSON(steps.cfg.outputs.json).approvers, github.event.sender.login) }}
+          E2E_LABEL: ${{ fromJSON(steps.cfg.outputs.json).labels.e2e_approved }}
+          MODE: ${{ vars.MG_GATES_MODE }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gate=$(jq -r --arg l "$LABEL" '[.labels.intent_approved, .labels.e2e_approved, .labels.deploy_approved] | index($l) != null' <<<"$CFG")
+          [ "$gate" = true ] || exit 0
+          if [ "$APPROVER" != true ]; then
+            gh issue edit "$N" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL"
+            gh issue comment "$N" --repo "$GITHUB_REPOSITORY" --body "🚫 \`$LABEL\` removed: @$SENDER is not listed in \`approvers\` of \`.github/mobius-gate.yaml\`. Only an approver can pass a gate."
+            exit 0
+          fi
+          if [ "$MODE" = label ] && [ "$LABEL" = "$E2E_LABEL" ] && [ -n "$HEAD_SHA" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" --silent \
+              -f state=success -f context=mg/e2e-approved -f description="E2E approved by @$SENDER"
+          fi
+
+  stale:
+    if: github.event.action == 'synchronize' && startsWith(github.head_ref, 'mg/')
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read, issues: write, pull-requests: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1, sparse-checkout: .github }
+      - id: cfg
+        uses: Revo2z/mobius-gate/actions/config@v0.1.0
+        with: { default-branch: "${{ github.event.repository.default_branch }}" }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.event.pull_request.number }}
+          E2E_LABEL: ${{ fromJSON(steps.cfg.outputs.json).labels.e2e_approved }}
+          HAS: ${{ contains(github.event.pull_request.labels.*.name, fromJSON(steps.cfg.outputs.json).labels.e2e_approved) }}
+        run: |
+          [ "$HAS" = true ] || exit 0
+          gh issue edit "$N" --repo "$GITHUB_REPOSITORY" --remove-label "$E2E_LABEL"
+          gh issue comment "$N" --repo "$GITHUB_REPOSITORY" --body "New commit: \`$E2E_LABEL\` removed, the E2E approval must be given again on the new code."

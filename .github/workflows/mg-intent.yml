@@ -1,0 +1,136 @@
+# mobius-gate — gate 1: an approver labels the intent → Claude opens the PR
+# with intent.md, spec.md, plan.md and the tests written first (TDD red).
+name: mg-intent
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: mg-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read, issues: write }
+    outputs:
+      go: ${{ steps.go.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1, sparse-checkout: .github }
+      - id: cfg
+        uses: Revo2z/mobius-gate/actions/config@v0.1.0
+        with: { default-branch: "${{ github.event.repository.default_branch }}" }
+      # Only an approver's label counts. contains() is case-insensitive, as logins are.
+      # A label set by anyone else is removed by mg-labels.yml.
+      - id: go
+        if: >-
+          github.event.label.name == fromJSON(steps.cfg.outputs.json).labels.intent_approved &&
+          contains(fromJSON(steps.cfg.outputs.json).approvers, github.event.sender.login)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.event.issue.number }}
+          STAGE: ${{ fromJSON(steps.cfg.outputs.json).labels.stage_prefix }}spec
+        run: |
+          gh issue edit "$N" --repo "$GITHUB_REPOSITORY" --add-label "$STAGE"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+  spec:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read }   # all writes go through the mobius-gate App token
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.MG_APP_ID }}
+          private-key: ${{ secrets.MG_APP_KEY }}
+      - uses: actions/checkout@v4
+        with: { token: "${{ steps.app.outputs.token }}", fetch-depth: 0 }
+      - id: cfg
+        uses: Revo2z/mobius-gate/actions/config@v0.1.0
+        with: { default-branch: "${{ github.event.repository.default_branch }}" }
+
+      - id: branch
+        name: Branch and intent.md (verbatim copy of the approved issue)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          N: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          URL: ${{ github.event.issue.html_url }}
+          SENDER: ${{ github.event.sender.login }}
+          WORK: ${{ fromJSON(steps.cfg.outputs.json).paths.work_dir }}
+        run: |
+          existing=$(git ls-remote --heads origin "mg/$N-*" | head -n 1 | sed 's|.*refs/heads/||')
+          if [ -n "$existing" ]; then
+            branch="$existing"; git switch "$branch"
+          else
+            slug=$(printf '%s' "$TITLE" | sed 's/^\[intent\] *//' | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
+                   | tr -cs 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z' | cut -c1-40 | sed 's/^-*//; s/-*$//')
+            branch="mg/$N-${slug:-intent}"; git switch -c "$branch"
+          fi
+          mkdir -p "$WORK/$N"
+          {
+            printf '# Intent #%s — %s\n\n' "$N" "${TITLE#\[intent\] }"
+            printf '> Verbatim copy of %s, approved by @%s on %s. The issue is the source of truth.\n\n' "$URL" "$SENDER" "$(date -u +%F)"
+            gh issue view "$N" --repo "$GITHUB_REPOSITORY" --json body --jq .body
+          } > "$WORK/$N/intent.md"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Spec (Claude)
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: "/mobius-gate:mg-spec ${{ github.event.issue.number }}"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app.outputs.token }}
+          claude_args: >-
+            --plugin-dir ${{ steps.cfg.outputs.plugin-dir }}
+            --model ${{ fromJSON(steps.cfg.outputs.json).models.spec.model || fromJSON(steps.cfg.outputs.json).models.default }}
+            --max-turns ${{ fromJSON(steps.cfg.outputs.json).models.spec.max_turns || 30 }}
+            --allowedTools Read,Glob,Grep,Write,Edit
+
+      - name: Plan and red tests (Claude)
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: "/mobius-gate:mg-plan ${{ github.event.issue.number }}"
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app.outputs.token }}
+          claude_args: >-
+            --plugin-dir ${{ steps.cfg.outputs.plugin-dir }}
+            --model ${{ fromJSON(steps.cfg.outputs.json).models.plan.model || fromJSON(steps.cfg.outputs.json).models.default }}
+            --max-turns ${{ fromJSON(steps.cfg.outputs.json).models.plan.max_turns || 60 }}
+            --allowedTools Read,Glob,Grep,Write,Edit,Bash
+            --disallowedTools "Bash(git push:*)" "Bash(git commit:*)" "Bash(gh:*)"
+
+      - name: Commit, push, open the PR (deterministic, not Claude)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          N: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          BASE: ${{ github.event.repository.default_branch }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+          WORK: ${{ fromJSON(steps.cfg.outputs.json).paths.work_dir }}
+          JUNIT: ${{ fromJSON(steps.cfg.outputs.json).commands.junit_report }}
+          STAGE: ${{ fromJSON(steps.cfg.outputs.json).labels.stage_prefix }}spec
+        run: |
+          for f in intent.md spec.md plan.md; do
+            [ -s "$WORK/$N/$f" ] || { echo "::error::$WORK/$N/$f is missing: the step did not finish"; exit 1; }
+          done
+          uid=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${uid}+${SLUG}[bot]@users.noreply.github.com"
+          git add -A
+          [ -n "$JUNIT" ] && git reset -q -- "$(dirname "$JUNIT")" 2>/dev/null || true
+          git commit -q -m "mg: spec, plan and red tests for #$N" || echo "nothing new to commit"
+          git push -q -u origin "$BRANCH"
+          if ! gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            sed "s/ISSUE/$N/g" .github/PULL_REQUEST_TEMPLATE/mobius-gate.md > "$RUNNER_TEMP/body.md"
+            gh pr create --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base "$BASE" \
+              --title "${TITLE#\[intent\] } (#$N)" --body-file "$RUNNER_TEMP/body.md" --label "$STAGE"
+          fi

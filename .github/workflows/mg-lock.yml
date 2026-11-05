@@ -1,0 +1,91 @@
+# mobius-gate — gate 2: an approver approves the PR (spec + plan + red tests)
+# → the tests are locked at the approved commit.
+#   - no lock yet                      → lock
+#   - lock, tests unchanged            → nothing (this is the final approval, gate 5)
+#   - lock, tests changed by a human   → re-lock only if the review body says "mg:relock"
+# The lock is a PR comment by github-actions[bot] (no other identity can write
+# one) mirrored in work/<issue>/tests.lock. Committing the mirror dismisses the
+# approval, as intended: the merge approval comes later, on the final code.
+name: mg-lock
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+concurrency:
+  group: mg-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  lock:
+    if: >-
+      github.event.review.state == 'approved' &&
+      startsWith(github.event.pull_request.head.ref, 'mg/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: write, pull-requests: write, issues: write, statuses: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.ref }}", fetch-depth: 0 }
+      - id: cfg
+        uses: Revo2z/mobius-gate/actions/config@v0.1.0
+        with: { default-branch: "${{ github.event.repository.default_branch }}" }
+      - id: who
+        env:
+          APPROVER: ${{ contains(fromJSON(steps.cfg.outputs.json).approvers, github.event.review.user.login) }}
+          LOGIN: ${{ github.event.review.user.login }}
+        run: |
+          echo "approver=$APPROVER" >> "$GITHUB_OUTPUT"
+          [ "$APPROVER" = true ] || echo "@$LOGIN is not a mobius-gate approver: no lock."
+      - id: lock
+        if: steps.who.outputs.approver == 'true'
+        uses: Revo2z/mobius-gate/actions/tests-lock@v0.1.0
+        with:
+          mode: state
+          pr: ${{ github.event.pull_request.number }}
+          head-ref: ${{ github.event.pull_request.head.ref }}
+          default-branch: ${{ github.event.repository.default_branch }}
+          token: ${{ github.token }}
+      - id: decide
+        if: steps.who.outputs.approver == 'true'
+        env:
+          STATE: ${{ steps.lock.outputs.state }}
+          RELOCK: ${{ contains(github.event.review.body, 'mg:relock') }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          case "$STATE" in
+            none) echo "record=true" >> "$GITHUB_OUTPUT" ;;
+            unchanged) echo "Tests unchanged since the lock: nothing to do." ;;
+            changed)
+              if [ "$RELOCK" = true ]; then echo "record=true" >> "$GITHUB_OUTPUT"
+              else
+                gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⚠️ Locked tests changed since the plan was approved, so \`mg/tests-locked\` stays red. If the change is intended, an approver re-approves with \`mg:relock\` in the review body: that approval is a new validation of the plan."
+              fi ;;
+          esac
+      - if: steps.decide.outputs.record == 'true'
+        uses: Revo2z/mobius-gate/actions/tests-lock@v0.1.0
+        with:
+          mode: record
+          pr: ${{ github.event.pull_request.number }}
+          head-ref: ${{ github.event.pull_request.head.ref }}
+          default-branch: ${{ github.event.repository.default_branch }}
+          commit: ${{ github.event.review.commit_id }}
+          approver: ${{ github.event.review.user.login }}
+          token: ${{ github.token }}
+      - if: steps.decide.outputs.record == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          P: ${{ fromJSON(steps.cfg.outputs.json).labels.stage_prefix }}
+        run: |
+          # A push made with GITHUB_TOKEN triggers no workflow: report the
+          # check on the lock commit ourselves (it was just verified by record).
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$(git rev-parse HEAD)" --silent \
+            -f state=success -f context=mg/tests-locked -f description="Tests locked at plan approval"
+          issue=$(printf '%s' "$HEAD_REF" | sed -n 's|^mg/\([0-9]*\).*|\1|p')
+          for n in "$PR" "$issue"; do
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --remove-label "${P}spec" --add-label "${P}build" || true
+          done

@@ -1,0 +1,63 @@
+# mobius-gate — pull request checks.
+# Job names are the required status check contexts (ruleset mg-review).
+# Required jobs always run and never end "skipped": GitHub counts a skipped
+# required check as passing.
+name: mg-ci
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: mg-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # A mobius-gate PR: an mg/<issue>-… branch of this repository (never a fork).
+  MG_PR: ${{ startsWith(github.head_ref, 'mg/') && github.event.pull_request.head.repo.full_name == github.repository }}
+
+jobs:
+  tests-locked:
+    name: mg/tests-locked
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read, pull-requests: read, issues: read }
+    steps:
+      - if: env.MG_PR != 'true'
+        run: echo "Not a mobius-gate PR — no tests lock applies."
+      - if: env.MG_PR == 'true'
+        uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0 }
+      - if: env.MG_PR == 'true'
+        uses: Revo2z/mobius-gate/actions/tests-lock@v0.1.0
+        with:
+          mode: verify
+          pr: ${{ github.event.pull_request.number }}
+          head-ref: ${{ github.head_ref }}
+          default-branch: ${{ github.event.repository.default_branch }}
+          token: ${{ github.token }}
+
+  tests-red:
+    # Informative (not required): before the lock, every new test must fail.
+    name: mg/tests-red
+    if: startsWith(github.head_ref, 'mg/') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.MG_RUNNER || '"ubuntu-latest"') }}
+    permissions: { contents: read, pull-requests: read, issues: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0 }
+      - id: lock
+        uses: Revo2z/mobius-gate/actions/tests-lock@v0.1.0
+        with:
+          mode: state
+          pr: ${{ github.event.pull_request.number }}
+          head-ref: ${{ github.head_ref }}
+          default-branch: ${{ github.event.repository.default_branch }}
+          token: ${{ github.token }}
+      - if: steps.lock.outputs.state != 'none'
+        run: echo "Tests are locked — the red phase is over."
+      - if: steps.lock.outputs.state == 'none'
+        uses: Revo2z/mobius-gate/actions/tests-red@v0.1.0
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          default-branch: ${{ github.event.repository.default_branch }}

@@ -1,0 +1,54 @@
+name: Intention (mobius-gate)
+description: Une intention = un besoin, un incident ou un bug, qui ira de l'issue à la prod via des gates humaines.
+title: "[intent] "
+labels: ["mg:intent"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Décrivez **le quoi et le pourquoi**, pas le comment. `/mg-intent` dans Claude Code aide à remplir ce formulaire par interview.
+        Gate : un approbateur pose le label `mg:intent-approved` ; Claude ouvre alors une PR avec la spec, le plan et les tests (rouges).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options: [Fonctionnalité, Incident, Bug, Test flaky, Dette technique]
+    validations: { required: true }
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problème
+      description: Ce qui ne va pas ou manque aujourd'hui, pour qui, et ce que cela coûte.
+    validations: { required: true }
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Résultat attendu
+      description: Ce qui sera vrai quand ce sera fini, vu de l'utilisateur.
+    validations: { required: true }
+  - type: textarea
+    id: journeys
+    attributes:
+      label: Parcours d'acceptation
+      description: |
+        Un parcours par bloc, avec des valeurs concrètes. Ils deviendront les tests E2E.
+      placeholder: |
+        Étant donné un utilisateur connecté avec 2 articles dans son panier
+        Quand il valide la commande
+        Alors il voit "Commande n° …" et reçoit un e-mail de confirmation
+    validations: { required: true }
+  - type: textarea
+    id: success
+    attributes:
+      label: Critères de succès mesurables
+      description: Chiffres, seuils, délais (optionnel).
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Contraintes
+      description: Sécurité, performance, compatibilité, données, réglementation.
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Hors périmètre
+      description: Ce que cette intention ne couvre pas.

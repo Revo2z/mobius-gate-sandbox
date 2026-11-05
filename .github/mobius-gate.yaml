@@ -1,0 +1,61 @@
+# mobius-gate configuration — the only file to customise.
+# Gates always read it from the default branch: a pull request cannot change
+# the rules that judge it. After editing, run /mg-init again to sync the
+# derived settings (CODEOWNERS, labels, repository variables, rulesets).
+version: 1
+
+# GitHub logins allowed to pass a gate (label, review, environment).
+approvers: [Revo2z]
+
+labels:
+  intent_approved: "mg:intent-approved"
+  e2e_approved: "mg:e2e-approved"        # used only when gates = label
+  deploy_approved: "mg:deploy-approved"  # used only when gates = label
+  blocked: "mg:blocked"
+  stage_prefix: "mg:stage-"              # spec | build | e2e | review | done
+
+stages:
+  e2e: false
+  deploy: false
+
+# Model per step (alias or full ID) and turn budget.
+models:
+  default: sonnet
+  spec: { model: sonnet, max_turns: 30 }
+  plan: { model: sonnet, max_turns: 60 }
+  build: { model: sonnet, max_turns: 100 }
+  e2e: { model: sonnet, max_turns: 40 }
+
+# GitHub-hosted label, or a list for self-hosted: [self-hosted, linux]
+runner: ubuntu-latest
+
+# auto: native GitHub gates when the plan allows them, label gates otherwise.
+gates: auto                              # auto | native | label
+
+paths:
+  work_dir: work
+  # Everything matching these globs is locked when the plan is approved.
+  tests: ["tests/**", "test/**", "**/*.test.*", "**/*.spec.*", "**/*_test.*", "**/test_*.*", "e2e/**"]
+  e2e: ["e2e/**"]
+  business_code: ["src/**"]              # coverage scope, passed as MG_COVERAGE_SCOPE
+
+# Shell commands. Empty = step skipped and reported.
+commands:
+  setup: "python3 -m pip install --user --break-system-packages pytest"  # install dependencies
+  lint: ""
+  test: "python3 -m pytest --junitxml=reports/junit.xml"  # unit + integration, writes junit_report
+  test_files: "python3 -m pytest {files} --junitxml=reports/junit.xml"  # {files} = test files to run (TDD red check), writes junit_report
+  junit_report: reports/junit.xml
+  coverage: ""                           # must fail below $MG_COVERAGE_MIN
+  preview: ""                            # deploys a preview, prints its URL on the last line
+  e2e: ""
+  e2e_artifacts: ["playwright-report/**", "test-results/**"]
+  deploy: ""
+
+coverage:
+  threshold: 80                          # % on business code, not 100
+
+# Which secret authenticates Claude in CI:
+#   oauth_token → CLAUDE_CODE_OAUTH_TOKEN (claude setup-token, Pro/Max subscription)
+#   api_key     → ANTHROPIC_API_KEY
+auth: oauth_token
